@@ -23,6 +23,7 @@ import glob
 import itertools
 import os
 import pickle
+import tempfile
 from typing import Any
 
 from alphagenome import colab_utils
@@ -39,6 +40,8 @@ from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import seaborn as sns
 
 pd.set_option('display.max_rows', None)
@@ -72,8 +75,15 @@ print(f'Loaded {len(API_KEYS)} AlphaGenome API key(s).')
 
 # @title Configuration & Atlas Client Initialization
 BED_FILE_PATH = '/users/PAS2905/coraalbers/ag/ag_data/noncoding.bed'  # Path to input 3-column BED file (chrom, start, end)
-OUTPUT_PARQUET_PATH = 'atlas_bed_variant_scores.parquet'
-TRACK_METADATA_PARQUET_PATH = 'atlas_track_metadata.parquet'
+# Checkpoints follow the script directory, not the directory sbatch was launched from.
+# Set ATLAS_OUTPUT_DIR to project space when the files outgrow home.
+_script_file = globals().get('__file__')
+SCRIPT_DIR = (
+    os.path.dirname(os.path.abspath(_script_file)) if _script_file else os.getcwd()
+)
+OUTPUT_DIR = os.path.abspath(os.environ.get('ATLAS_OUTPUT_DIR', SCRIPT_DIR))
+OUTPUT_PARQUET_PATH = os.path.join(OUTPUT_DIR, 'atlas_bed_variant_scores.parquet')
+TRACK_METADATA_PARQUET_PATH = os.path.join(OUTPUT_DIR, 'atlas_track_metadata.parquet')
 
 # Target gene filter for gene-level scorers (e.g., RNA_SEQ, SPLICE_JUNCTIONS)
 TARGET_GENE_SYMBOL = 'LMNA'
@@ -112,6 +122,38 @@ print(f'Experimental track scorers ({len(EXPERIMENTAL_SCORERS)}): {EXPERIMENTAL_
 
 
 # @title Export Track Metadata Catalog to Parquet
+def _atomic_save_parquet(df: pd.DataFrame, output_parquet_path: str) -> None:
+    """Atomically writes a DataFrame to Parquet so an interrupted checkpoint cannot corrupt the file.
+
+    The temp file is created in the destination directory, written only by pyarrow, fsynced,
+    then renamed into place. pandas.DataFrame.to_parquet is not used: it opens the path
+    itself and pyarrow opens it again, and closing the empty first handle last can drop or
+    truncate the file on cluster filesystems.
+    """
+    output_parquet_path = os.path.abspath(output_parquet_path)
+    out_dir = os.path.dirname(output_parquet_path) or '.'
+    os.makedirs(out_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(output_parquet_path)}.',
+        suffix='.parquet',
+        dir=out_dir,
+    )
+    os.close(fd)
+    try:
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        pq.write_table(table, tmp_path, compression='snappy')
+        with open(tmp_path, 'rb') as synced:
+            os.fsync(synced.fileno())
+        os.replace(tmp_path, output_parquet_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def build_track_metadata_catalog(scorer_map: dict[str, Any]) -> pd.DataFrame:
     """Compiles track metadata across all experimental scorers into a DataFrame."""
     rows = []
@@ -141,7 +183,7 @@ def build_track_metadata_catalog(scorer_map: dict[str, Any]) -> pd.DataFrame:
 
 
 track_metadata_df = build_track_metadata_catalog(scorer_meta_map)
-track_metadata_df.to_parquet(TRACK_METADATA_PARQUET_PATH, index=False)
+_atomic_save_parquet(track_metadata_df, TRACK_METADATA_PARQUET_PATH)
 print(
     f'Saved {len(track_metadata_df)} track metadata records to '
     f'{TRACK_METADATA_PARQUET_PATH}'
@@ -606,13 +648,6 @@ def score_bed_interval_chunk(
 
 
 # @title Score All Regions in the BED File & Iteratively Save/Resume Parquet
-def _atomic_save_parquet(df: pd.DataFrame, output_parquet_path: str) -> None:
-    """Atomically writes DataFrame to Parquet via a temporary file so interruptions never corrupt the file."""
-    tmp_path = f'{output_parquet_path}.tmp'
-    df.to_parquet(tmp_path, index=False)
-    os.replace(tmp_path, output_parquet_path)
-
-
 def score_all_bed_regions(
     bed_regions_df: pd.DataFrame,
     clients: list[atlas.AtlasClient] = atlas_clients,

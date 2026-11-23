@@ -4,3 +4,4 @@
 analysis_outputs/
 .ipynb_checkpoints/
 .env
+.cursor/
